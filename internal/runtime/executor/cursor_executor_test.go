@@ -273,7 +273,7 @@ func TestProcessH2SessionFramesFailsUnsupportedExecRequest(t *testing.T) {
 	var execMessage []byte
 	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_Id, protowire.VarintType)
 	execMessage = protowire.AppendVarint(execMessage, 7)
-	execMessage = protowire.AppendTag(execMessage, 17, protowire.BytesType)
+	execMessage = protowire.AppendTag(execMessage, 99, protowire.BytesType)
 	execMessage = protowire.AppendBytes(execMessage, nil)
 	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ExecId, protowire.BytesType)
 	execMessage = protowire.AppendString(execMessage, "unsupported-exec")
@@ -287,8 +287,38 @@ func TestProcessH2SessionFramesFailsUnsupportedExecRequest(t *testing.T) {
 		stream.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
 	}()
 	err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, nil, nil, nil, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "unsupported exec request field 17") {
+	if err == nil || !strings.Contains(err.Error(), "unsupported exec request field 99") {
 		t.Fatalf("processH2SessionFrames() error = %v", err)
+	}
+}
+
+func TestProcessH2SessionFramesAnswersListMcpResources(t *testing.T) {
+	var execMessage []byte
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_Id, protowire.VarintType)
+	execMessage = protowire.AppendVarint(execMessage, 7)
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ListMcpResourcesArgs, protowire.BytesType)
+	execMessage = protowire.AppendBytes(execMessage, nil)
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ExecId, protowire.BytesType)
+	execMessage = protowire.AppendString(execMessage, "list-resources")
+
+	var serverMessage []byte
+	serverMessage = protowire.AppendTag(serverMessage, cursorproto.ASM_ExecServerMessage, protowire.BytesType)
+	serverMessage = protowire.AppendBytes(serverMessage, execMessage)
+
+	var written []byte
+	stream := &recordingCursorStream{inner: newFakeCursorStream(), capture: &written}
+	go func() {
+		stream.inner.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
+		close(stream.inner.data)
+	}()
+	if err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("processH2SessionFrames() error = %v", err)
+	}
+	if !bytes.Contains(written, []byte("list-resources")) {
+		t.Fatalf("response did not preserve exec ID: %x", written)
+	}
+	if !bytes.Contains(written, protowire.AppendTag(nil, cursorproto.ECM_ListMcpResourcesResult, protowire.BytesType)) {
+		t.Fatalf("response did not use list MCP resources result field: %x", written)
 	}
 }
 
@@ -967,6 +997,69 @@ func TestCursorOpenAIToolResultUsesColdContinuation(t *testing.T) {
 	}
 }
 
+func TestCursorResponsesPromptCacheKeyIsolatesConcurrentStreams(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstCanceled := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	var processMu sync.Mutex
+	processCount := 0
+	e := newCursorExecutorHarness(func(ctx context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
+		processMu.Lock()
+		processCount++
+		current := processCount
+		processMu.Unlock()
+		if current == 1 {
+			onText("first still running", false)
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+				return nil
+			case <-ctx.Done():
+				firstCanceled <- struct{}{}
+				return ctx.Err()
+			}
+		}
+		onText("second completed", false)
+		return nil
+	})
+
+	firstPayload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"thread-one","input":"first"}`)
+	first, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: firstPayload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: firstPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-firstStarted
+
+	secondPayload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"thread-two","input":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	second, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: secondPayload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: secondPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody := cursorStreamPayload(collectCursorStream(t, second))
+	if !strings.Contains(secondBody, "second completed") {
+		t.Fatalf("second stream did not complete: %s", secondBody)
+	}
+	select {
+	case <-firstCanceled:
+		t.Fatal("second Responses thread canceled the first thread's Cursor stream")
+	default:
+	}
+
+	close(releaseFirst)
+	firstChunks := collectCursorStream(t, first)
+	for _, chunk := range firstChunks {
+		if chunk.Err != nil {
+			t.Fatalf("first stream ended with error: %v", chunk.Err)
+		}
+	}
+}
+
 func TestCursorExecuteStreamConcurrentCancelAndFirstEmit(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		gate := make(chan struct{})
@@ -1108,7 +1201,7 @@ func TestCursorExecuteNonStreamFlattensConversationTurns(t *testing.T) {
 	}
 	plain := parseOpenAIRequest(payload)
 	apiKey := apiKeyFromContext(context.Background())
-	convID := deriveConversationId(apiKey, extractClaudeCodeSessionId(payload), plain.SystemPrompt)
+	convID := deriveConversationId(apiKey, extractCursorSessionID(payload), plain.SystemPrompt)
 	withTurns := cursorproto.EncodeRunRequest(buildRunRequestParams(plain, convID, req.Model))
 	if bytes.Equal(wire, withTurns) {
 		t.Fatalf("wire matches the unflattened turns encoding; flatten fix not applied")

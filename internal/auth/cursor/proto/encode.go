@@ -548,6 +548,27 @@ func EncodeExecMcpStateResult(execMsgId uint32, execId string, serverIDs []strin
 	return client
 }
 
+// EncodeExecListMcpResourcesResult reports an empty resource catalog. Amp
+// exposes function tools to Cursor, but does not expose MCP resources.
+func EncodeExecListMcpResourcesResult(execMsgId uint32, execId string) []byte {
+	var result []byte
+	result = protowire.AppendTag(result, 1, protowire.BytesType) // success
+	result = protowire.AppendBytes(result, nil)
+
+	var execClient []byte
+	execClient = protowire.AppendTag(execClient, ECM_Id, protowire.VarintType)
+	execClient = protowire.AppendVarint(execClient, uint64(execMsgId))
+	execClient = protowire.AppendTag(execClient, ECM_ExecId, protowire.BytesType)
+	execClient = protowire.AppendString(execClient, execId)
+	execClient = protowire.AppendTag(execClient, ECM_ListMcpResourcesResult, protowire.BytesType)
+	execClient = protowire.AppendBytes(execClient, result)
+
+	var client []byte
+	client = protowire.AppendTag(client, 2, protowire.BytesType)
+	client = protowire.AppendBytes(client, execClient)
+	return client
+}
+
 func encodeMcpToolDefinition(tool McpToolDef) []byte {
 	var definition []byte
 	definition = protowire.AppendTag(definition, 1, protowire.BytesType)

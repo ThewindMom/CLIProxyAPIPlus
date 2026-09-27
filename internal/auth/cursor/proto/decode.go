@@ -12,31 +12,32 @@ import (
 type ServerMessageType int
 
 const (
-	ServerMsgUnknown             ServerMessageType = iota
-	ServerMsgTextDelta                             // Text content delta
-	ServerMsgThinkingDelta                         // Thinking/reasoning delta
-	ServerMsgThinkingCompleted                     // Thinking completed
-	ServerMsgKvGetBlob                             // Server wants a blob
-	ServerMsgKvSetBlob                             // Server wants to store a blob
-	ServerMsgExecRequestCtx                        // Server requests context (tools, etc.)
-	ServerMsgExecMcpArgs                           // Server wants MCP tool execution
-	ServerMsgExecShellArgs                         // Rejected: shell command
-	ServerMsgExecReadArgs                          // Rejected: file read
-	ServerMsgExecWriteArgs                         // Rejected: file write
-	ServerMsgExecDeleteArgs                        // Rejected: file delete
-	ServerMsgExecLsArgs                            // Rejected: directory listing
-	ServerMsgExecGrepArgs                          // Rejected: grep search
-	ServerMsgExecFetchArgs                         // Rejected: HTTP fetch
-	ServerMsgExecDiagnostics                       // Respond with empty diagnostics
-	ServerMsgExecShellStream                       // Rejected: shell stream
-	ServerMsgExecBgShellSpawn                      // Rejected: background shell
-	ServerMsgExecWriteShellStdin                   // Rejected: write shell stdin
-	ServerMsgExecMcpState                          // Server requests dynamic MCP tool state
-	ServerMsgExecOther                             // Other exec types (respond with empty)
-	ServerMsgTurnEnded                             // Turn has ended (no more output)
-	ServerMsgHeartbeat                             // Server heartbeat
-	ServerMsgTokenDelta                            // Token usage delta
-	ServerMsgCheckpoint                            // Conversation checkpoint update
+	ServerMsgUnknown              ServerMessageType = iota
+	ServerMsgTextDelta                              // Text content delta
+	ServerMsgThinkingDelta                          // Thinking/reasoning delta
+	ServerMsgThinkingCompleted                      // Thinking completed
+	ServerMsgKvGetBlob                              // Server wants a blob
+	ServerMsgKvSetBlob                              // Server wants to store a blob
+	ServerMsgExecRequestCtx                         // Server requests context (tools, etc.)
+	ServerMsgExecMcpArgs                            // Server wants MCP tool execution
+	ServerMsgExecShellArgs                          // Rejected: shell command
+	ServerMsgExecReadArgs                           // Rejected: file read
+	ServerMsgExecWriteArgs                          // Rejected: file write
+	ServerMsgExecDeleteArgs                         // Rejected: file delete
+	ServerMsgExecLsArgs                             // Rejected: directory listing
+	ServerMsgExecGrepArgs                           // Rejected: grep search
+	ServerMsgExecFetchArgs                          // Rejected: HTTP fetch
+	ServerMsgExecDiagnostics                        // Respond with empty diagnostics
+	ServerMsgExecShellStream                        // Rejected: shell stream
+	ServerMsgExecBgShellSpawn                       // Rejected: background shell
+	ServerMsgExecWriteShellStdin                    // Rejected: write shell stdin
+	ServerMsgExecMcpState                           // Server requests dynamic MCP tool state
+	ServerMsgExecListMcpResources                   // Server requests MCP resources
+	ServerMsgExecOther                              // Other exec types (respond with empty)
+	ServerMsgTurnEnded                              // Turn has ended (no more output)
+	ServerMsgHeartbeat                              // Server heartbeat
+	ServerMsgTokenDelta                             // Token usage delta
+	ServerMsgCheckpoint                             // Conversation checkpoint update
 )
 
 // DecodedServerMessage holds parsed data from an AgentServerMessage.
@@ -87,6 +88,7 @@ func isReplyRequiredType(t ServerMessageType) bool {
 		ServerMsgExecDeleteArgs, ServerMsgExecLsArgs, ServerMsgExecGrepArgs,
 		ServerMsgExecFetchArgs, ServerMsgExecDiagnostics, ServerMsgExecShellStream,
 		ServerMsgExecBgShellSpawn, ServerMsgExecWriteShellStdin, ServerMsgExecMcpState,
+		ServerMsgExecListMcpResources,
 		ServerMsgExecOther:
 		return true
 	}
@@ -370,6 +372,8 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 			case ESM_BackgroundShellSpawn:
 				msg.Type = ServerMsgExecBgShellSpawn
 				decodeShellArgs(val, msg) // same structure
+			case ESM_ListMcpResourcesArgs:
+				msg.Type = ServerMsgExecListMcpResources
 			case ESM_WriteShellStdinArgs:
 				msg.Type = ServerMsgExecWriteShellStdin
 			case ESM_McpStateExecArgs:

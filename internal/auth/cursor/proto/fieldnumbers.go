@@ -183,6 +183,7 @@ const (
 	ESM_McpArgs              = 11 // McpArgs
 	ESM_ShellStreamArgs      = 14 // ShellArgs (stream variant)
 	ESM_BackgroundShellSpawn = 16 // BackgroundShellSpawnArgs
+	ESM_ListMcpResourcesArgs = 17 // ListMcpResourcesExecArgs
 	ESM_FetchArgs            = 20 // FetchArgs
 	ESM_WriteShellStdinArgs  = 23 // WriteShellStdinArgs
 	ESM_McpStateExecArgs     = 36 // McpStateExecArgs
@@ -204,6 +205,7 @@ const (
 	ECM_McpResult               = 11
 	ECM_ShellStream             = 14
 	ECM_BackgroundShellSpawnRes = 16
+	ECM_ListMcpResourcesResult  = 17
 	ECM_FetchResult             = 20
 	ECM_WriteShellStdinResult   = 23
 	ECM_McpStateExecResult      = 36

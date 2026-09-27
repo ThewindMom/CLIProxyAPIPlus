@@ -437,7 +437,10 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer usageReporter.TrackFailure(ctx, &err)
 
 	parsed := parseOpenAIRequest(payload)
-	sessionID := extractClaudeCodeSessionId(req.Payload)
+	sessionID := extractCursorSessionID(req.Payload)
+	if sessionID == "" && len(opts.OriginalRequest) > 0 {
+		sessionID = extractCursorSessionID(opts.OriginalRequest)
+	}
 	conversationID := deriveConversationId(apiKeyFromContext(ctx), sessionID, parsed.SystemPrompt)
 	openAICompatible := isOpenAICompatibleSourceFormat(from)
 	if openAICompatible && len(parsed.ToolResults) > 0 {
@@ -578,10 +581,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, fmt.Errorf("cursor: access token not found")
 	}
 
-	// Extract session_id before translation, which strips metadata.
-	sessionID := extractClaudeCodeSessionId(req.Payload)
+	// Extract the client session identity before translation strips metadata.
+	sessionID := extractCursorSessionID(req.Payload)
 	if sessionID == "" && len(opts.OriginalRequest) > 0 {
-		sessionID = extractClaudeCodeSessionId(opts.OriginalRequest)
+		sessionID = extractCursorSessionID(opts.OriginalRequest)
 	}
 
 	upstreamModel, errResolve := helps.ResolveCursorRequestModel(auth.ID, req, opts, cursorModelsOrFallback)
@@ -1479,6 +1482,10 @@ func processH2SessionFrames(
 					if errReply := writeCursorReply(stream, resp); errReply != nil {
 						return errReply
 					}
+				case cursorproto.ServerMsgExecListMcpResources:
+					if errReply := writeCursorReply(stream, cursorproto.EncodeExecListMcpResourcesResult(msg.ExecMsgId, msg.ExecId)); errReply != nil {
+						return errReply
+					}
 
 				case cursorproto.ServerMsgExecMcpArgs:
 					if onMcpExec != nil {
@@ -1562,6 +1569,10 @@ func processH2SessionFrames(
 										}
 									case cursorproto.ServerMsgExecMcpState:
 										if errReply := writeCursorReply(stream, cursorproto.EncodeExecMcpStateResult(wmsg.ExecMsgId, wmsg.ExecId, wmsg.McpServerIDs, mcpTools)); errReply != nil {
+											return errReply
+										}
+									case cursorproto.ServerMsgExecListMcpResources:
+										if errReply := writeCursorReply(stream, cursorproto.EncodeExecListMcpResourcesResult(wmsg.ExecMsgId, wmsg.ExecId)); errReply != nil {
 											return errReply
 										}
 									case cursorproto.ServerMsgExecOther:
@@ -1957,16 +1968,17 @@ func extractCCH(systemPrompt string) string {
 	return rest[:end]
 }
 
-// extractClaudeCodeSessionId extracts session_id from Claude Code's metadata.user_id JSON.
-// Format: {"metadata":{"user_id":"{\"session_id\":\"xxx\",\"device_id\":\"yyy\"}"}}
-func extractClaudeCodeSessionId(payload []byte) string {
+// extractCursorSessionID returns the stable client conversation identity. Claude
+// metadata takes priority; OpenAI Responses clients identify a thread through
+// prompt_cache_key.
+func extractCursorSessionID(payload []byte) string {
 	userIdStr := gjson.GetBytes(payload, "metadata.user_id").String()
-	if userIdStr == "" {
-		return ""
+	if userIdStr != "" {
+		if sessionID := gjson.Get(userIdStr, "session_id").String(); sessionID != "" {
+			return sessionID
+		}
 	}
-	// user_id is a JSON string that needs to be parsed again
-	sid := gjson.Get(userIdStr, "session_id").String()
-	return sid
+	return strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
 }
 
 // deriveConversationId generates a deterministic conversation_id.
