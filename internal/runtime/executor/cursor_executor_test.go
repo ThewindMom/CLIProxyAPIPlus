@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -950,21 +951,21 @@ func TestCursorResumeRejectsUnmatchedToolResultAndRestoresSession(t *testing.T) 
 	}
 }
 
-func TestCursorOpenAIToolResultUsesColdContinuation(t *testing.T) {
+func TestCursorResponsesToolResultResumesLiveSession(t *testing.T) {
 	clientID := normalizeToolCallID("call immediate")
 	var processMu sync.Mutex
 	processCount := 0
 	e := newCursorExecutorHarness(func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), onMcpExec func(pendingMcpExec), toolResultCh <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
-		if toolResultCh != nil {
-			return errors.New("OpenAI request parked an H2 tool session")
+		if toolResultCh == nil {
+			return errors.New("OpenAI request did not create a resumable H2 tool session")
 		}
 		processMu.Lock()
 		processCount++
-		current := processCount
 		processMu.Unlock()
-		if current == 1 {
-			onMcpExec(pendingMcpExec{ToolCallId: clientID, ToolName: "read", Args: `{}`})
-			return nil
+		onMcpExec(pendingMcpExec{ToolCallId: clientID, ToolName: "read", Args: `{}`})
+		results := <-toolResultCh
+		if len(results) != 1 || results[0].ToolCallId != clientID || results[0].Content != "file contents" {
+			return fmt.Errorf("unexpected resumed tool results: %#v", results)
 		}
 		onText("after tool", false)
 		return nil
@@ -979,30 +980,32 @@ func TestCursorOpenAIToolResultUsesColdContinuation(t *testing.T) {
 		return newFakeCursorStream(), nil
 	}
 
-	openAI := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
-	first, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cursorTestRequest(true), openAI)
+	firstPayload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"thread-one","input":"hello"}`)
+	responses := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: firstPayload}
+	first, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: firstPayload}, responses)
 	if err != nil {
 		t.Fatal(err)
 	}
 	firstBody := cursorStreamPayload(collectCursorStream(t, first))
-	if !strings.Contains(firstBody, `"finish_reason":"tool_calls"`) || strings.Contains(firstBody, `"finish_reason":"stop"`) {
-		t.Fatalf("first OpenAI tool boundary is invalid:\n%s", firstBody)
+	if !strings.Contains(firstBody, `"type":"function_call"`) || !strings.Contains(firstBody, `"type":"response.completed"`) {
+		t.Fatalf("first Responses tool boundary is invalid:\n%s", firstBody)
 	}
 	e.mu.Lock()
 	parkedSessions := len(e.sessions)
 	e.mu.Unlock()
-	if parkedSessions != 0 {
-		t.Fatalf("OpenAI tool call parked %d H2 session(s)", parkedSessions)
+	if parkedSessions != 1 {
+		t.Fatalf("OpenAI tool call parked %d H2 session(s), want 1", parkedSessions)
 	}
 
-	secondPayload := []byte(`{"model":"cursor-test-model","stream":true,"messages":[{"role":"user","content":"hello"},{"role":"assistant","tool_calls":[{"id":"` + clientID + `","type":"function","function":{"name":"read","arguments":"{}"}}]},{"role":"tool","tool_call_id":"` + clientID + `","content":"file contents"}]}`)
-	second, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: secondPayload}, openAI)
+	secondPayload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"thread-one","input":[{"type":"function_call","call_id":"` + clientID + `","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"` + clientID + `","output":"file contents"}]}`)
+	responses.OriginalRequest = secondPayload
+	second, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: secondPayload}, responses)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondBody := cursorStreamPayload(collectCursorStream(t, second))
-	if !strings.Contains(secondBody, `"content":"after tool"`) || !strings.Contains(secondBody, `"finish_reason":"stop"`) {
-		t.Fatalf("cold continuation did not complete normally:\n%s", secondBody)
+	if !strings.Contains(secondBody, `"delta":"after tool"`) || !strings.Contains(secondBody, `"type":"response.completed"`) {
+		t.Fatalf("resumed continuation did not complete normally:\n%s", secondBody)
 	}
 
 	openMu.Lock()
@@ -1011,8 +1014,8 @@ func TestCursorOpenAIToolResultUsesColdContinuation(t *testing.T) {
 	processMu.Lock()
 	gotProcessCount := processCount
 	processMu.Unlock()
-	if gotOpenCount != 2 || gotProcessCount != 2 {
-		t.Fatalf("cold continuation opens=%d processor calls=%d, want 2 and 2", gotOpenCount, gotProcessCount)
+	if gotOpenCount != 1 || gotProcessCount != 1 {
+		t.Fatalf("resumed continuation opens=%d processor calls=%d, want 1 and 1", gotOpenCount, gotProcessCount)
 	}
 }
 
