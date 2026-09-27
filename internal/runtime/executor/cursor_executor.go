@@ -645,11 +645,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Unlock()
 
 		if hasSession && session.stream != nil && session.authID == authID {
+			sessionAgeMillis := time.Since(session.createdAt).Milliseconds()
 			log.WithFields(log.Fields{
 				"conversation_id": conversationId,
-				"session_age_ms":  time.Since(session.createdAt).Milliseconds(),
+				"session_age_ms":  sessionAgeMillis,
 				"tool_results":    len(parsed.ToolResults),
-			}).Info("cursor: resuming live tool session")
+			}).Infof("cursor: resuming live tool session (age_ms=%d tool_results=%d)", sessionAgeMillis, len(parsed.ToolResults))
 			return e.resumeWithToolResults(ctx, sessionKey, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
 		}
 		if hasSession && session.authID != authID {
@@ -661,7 +662,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			"conversation_id": conversationId,
 			"reason":          fallbackReason,
 			"tool_results":    len(parsed.ToolResults),
-		}).Info("cursor: rebuilding tool continuation from transcript")
+		}).Infof("cursor: rebuilding tool continuation from transcript (reason=%s tool_results=%d)", fallbackReason, len(parsed.ToolResults))
 	}
 
 	// Clean up any stale session for this key (or from a previous auth on same conversation)
