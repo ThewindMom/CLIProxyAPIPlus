@@ -1019,6 +1019,36 @@ func TestCursorResponsesToolResultResumesLiveSession(t *testing.T) {
 	}
 }
 
+func TestCursorResponsesToolResultFallsBackWithoutLiveSession(t *testing.T) {
+	clientID := normalizeToolCallID("call missing session")
+	var written []byte
+	e := newCursorExecutorHarness(func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
+		onText("recovered", false)
+		return nil
+	})
+	e.openStream = func(string) (cursorStream, error) {
+		return &recordingCursorStream{inner: newFakeCursorStream(), capture: &written}, nil
+	}
+
+	payload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"restarted-thread","input":[{"type":"function_call","call_id":"` + clientID + `","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"` + clientID + `","output":"file contents"}]}`)
+	result, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := cursorStreamPayload(collectCursorStream(t, result))
+	if !strings.Contains(body, `"delta":"recovered"`) || !strings.Contains(body, `"type":"response.completed"`) {
+		t.Fatalf("cold fallback did not complete normally:\n%s", body)
+	}
+
+	_, wire, _, ok := cursorproto.ParseConnectFrame(written)
+	if !ok || !strings.Contains(string(wire), "file contents") {
+		t.Fatalf("cold fallback omitted tool result from wire request: %q", wire)
+	}
+}
+
 func TestCursorResponsesPromptCacheKeyIsolatesConcurrentStreams(t *testing.T) {
 	firstStarted := make(chan struct{})
 	firstCanceled := make(chan struct{}, 1)

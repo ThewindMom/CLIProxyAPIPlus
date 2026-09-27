@@ -617,6 +617,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	sessionKey := authID + ":" + conversationId
 	checkpointKey := conversationId
 	needsTranslate := from.String() != "" && from.String() != "openai"
+	coldToolContinuation := false
 
 	// Continue a live Cursor H2 session when the caller returns tool results.
 	// This works across all source protocols: the HTTP request may end at the
@@ -647,6 +648,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if hasSession && session.authID != authID {
 			log.Warnf("cursor: session %s belongs to auth %s, but request is from %s — skipping resume", sessionKey, session.authID, authID)
 		}
+		coldToolContinuation = true
+		e.retireConversationState(conversationId)
+		log.Infof("cursor: live tool session unavailable; rebuilding continuation from transcript")
 	}
 
 	// Clean up any stale session for this key (or from a previous auth on same conversation)
@@ -680,7 +684,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	params := buildRunRequestParams(parsed, conversationId, upstreamModel)
 
-	if hasCheckpoint && saved.data != nil && saved.authID == authID {
+	if coldToolContinuation {
+		flattenConversationIntoUserText(parsed)
+		params = buildRunRequestParams(parsed, conversationId, upstreamModel)
+	} else if hasCheckpoint && saved.data != nil && saved.authID == authID {
 		// Same auth — use checkpoint normally.
 		log.Debugf("cursor: using saved checkpoint (%d bytes) for conv=%s auth=%s", len(saved.data), checkpointKey, authID)
 		params.RawCheckpoint = saved.data
