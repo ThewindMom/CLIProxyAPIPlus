@@ -623,14 +623,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// This works across all source protocols: the HTTP request may end at the
 	// tool boundary while the upstream Cursor stream remains parked.
 	if len(parsed.ToolResults) > 0 {
+		fallbackReason := "missing_session"
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
 		if hasSession {
 			delete(e.sessions, sessionKey)
+			fallbackReason = "unusable_session"
 		}
 		if !hasSession {
 			if oldKey := e.findSessionByConversationLocked(conversationId); oldKey != "" {
 				oldSession := e.sessions[oldKey]
+				fallbackReason = "auth_migrated"
 				log.Infof("cursor: cleaning up stale session from auth %s for conv=%s (auth migrated to %s)", oldSession.authID, conversationId, authID)
 				oldSession.cancel()
 				if oldSession.stream != nil {
@@ -642,7 +645,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Unlock()
 
 		if hasSession && session.stream != nil && session.authID == authID {
-			log.Debugf("cursor: resuming session %s with %d tool results", sessionKey, len(parsed.ToolResults))
+			log.WithFields(log.Fields{
+				"conversation_id": conversationId,
+				"session_age_ms":  time.Since(session.createdAt).Milliseconds(),
+				"tool_results":    len(parsed.ToolResults),
+			}).Info("cursor: resuming live tool session")
 			return e.resumeWithToolResults(ctx, sessionKey, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
 		}
 		if hasSession && session.authID != authID {
@@ -650,7 +657,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		coldToolContinuation = true
 		e.retireConversationState(conversationId)
-		log.Infof("cursor: live tool session unavailable; rebuilding continuation from transcript")
+		log.WithFields(log.Fields{
+			"conversation_id": conversationId,
+			"reason":          fallbackReason,
+			"tool_results":    len(parsed.ToolResults),
+		}).Info("cursor: rebuilding tool continuation from transcript")
 	}
 
 	// Clean up any stale session for this key (or from a previous auth on same conversation)
