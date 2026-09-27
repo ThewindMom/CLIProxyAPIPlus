@@ -83,6 +83,7 @@ type cursorFrameProcessor func(
 	stream cursorStream,
 	blobStore map[string][]byte,
 	mcpTools []cursorproto.McpToolDef,
+	systemPrompt string,
 	onText func(text string, isThinking bool),
 	onMcpExec func(exec pendingMcpExec),
 	toolResultCh <-chan []toolResultInfo,
@@ -484,7 +485,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			toolCalls = append(toolCalls, toolCall)
 		}
 	}
-	if streamErr := e.processFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
+	if streamErr := e.processFrames(sessionCtx, stream, params.BlobStore, params.McpTools, params.SystemPrompt,
 		func(text string, isThinking bool) {
 			if isThinking {
 				thinkingText.WriteString(text)
@@ -874,7 +875,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			emitTextDelta,
 		)
 
-		streamErr := e.processFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
+		streamErr := e.processFrames(sessionCtx, stream, params.BlobStore, params.McpTools, params.SystemPrompt,
 			streamCoalescer.push,
 			func(exec pendingMcpExec) {
 				// Preserve ordering: all assistant text must reach the client
@@ -1360,6 +1361,7 @@ func processH2SessionFrames(
 	stream cursorStream,
 	blobStore map[string][]byte,
 	mcpTools []cursorproto.McpToolDef,
+	systemPrompt string,
 	onText func(text string, isThinking bool),
 	onMcpExec func(exec pendingMcpExec),
 	toolResultCh <-chan []toolResultInfo, // nil for no tool result injection; non-nil to wait for results
@@ -1473,7 +1475,7 @@ func processH2SessionFrames(
 					}
 
 				case cursorproto.ServerMsgExecRequestCtx:
-					resp := cursorproto.EncodeExecRequestContextResult(msg.ExecMsgId, msg.ExecId, mcpTools)
+					resp := cursorproto.EncodeExecRequestContextResult(msg.ExecMsgId, msg.ExecId, systemPrompt, mcpTools)
 					if errReply := writeCursorReply(stream, resp); errReply != nil {
 						return errReply
 					}
@@ -1564,7 +1566,7 @@ func processH2SessionFrames(
 											return errReply
 										}
 									case cursorproto.ServerMsgExecRequestCtx:
-										if errReply := writeCursorReply(stream, cursorproto.EncodeExecRequestContextResult(wmsg.ExecMsgId, wmsg.ExecId, mcpTools)); errReply != nil {
+										if errReply := writeCursorReply(stream, cursorproto.EncodeExecRequestContextResult(wmsg.ExecMsgId, wmsg.ExecId, systemPrompt, mcpTools)); errReply != nil {
 											return errReply
 										}
 									case cursorproto.ServerMsgExecMcpState:

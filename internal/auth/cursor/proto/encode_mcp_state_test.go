@@ -56,6 +56,30 @@ func TestEncodeExecMcpStateResultUsesCurrentCursorSchema(t *testing.T) {
 	}
 }
 
+func TestEncodeExecRequestContextResultIncludesSystemPromptAsGlobalRule(t *testing.T) {
+	payload := EncodeExecRequestContextResult(9, "exec-9", "Return only a concise title.", nil)
+
+	execClient := requireBytesField(t, payload, 2)
+	result := requireBytesField(t, execClient, ECM_RequestContextResult)
+	success := requireBytesField(t, result, RCR_Success)
+	requestContext := requireBytesField(t, success, RCS_RequestContext)
+	rule := requireBytesField(t, requestContext, RC_Rules)
+
+	if got := string(requireBytesField(t, rule, 1)); got != "/cliproxyapi/system-prompt.mdc" {
+		t.Fatalf("rule full_path = %q", got)
+	}
+	if got := string(requireBytesField(t, rule, 2)); got != "Return only a concise title." {
+		t.Fatalf("rule content = %q", got)
+	}
+	ruleType := requireBytesField(t, rule, 3)
+	if !hasField(ruleType, 1) {
+		t.Fatal("rule type is not global")
+	}
+	if got := requireVarintField(t, rule, 4); got != 2 {
+		t.Fatalf("rule source = %d, want CURSOR_RULE_SOURCE_USER (2)", got)
+	}
+}
+
 func requireBytesField(t *testing.T, message []byte, wanted protowire.Number) []byte {
 	t.Helper()
 	for len(message) > 0 {
@@ -102,4 +126,33 @@ func hasField(message []byte, wanted protowire.Number) bool {
 		message = message[fieldLength:]
 	}
 	return false
+}
+
+func requireVarintField(t *testing.T, message []byte, wanted protowire.Number) uint64 {
+	t.Helper()
+	for len(message) > 0 {
+		number, wireType, tagLength := protowire.ConsumeTag(message)
+		if tagLength < 0 {
+			t.Fatalf("invalid protobuf tag: %v", protowire.ParseError(tagLength))
+		}
+		message = message[tagLength:]
+		if wireType == protowire.VarintType {
+			value, valueLength := protowire.ConsumeVarint(message)
+			if valueLength < 0 {
+				t.Fatalf("invalid varint field %d: %v", number, protowire.ParseError(valueLength))
+			}
+			if number == wanted {
+				return value
+			}
+			message = message[valueLength:]
+			continue
+		}
+		fieldLength := protowire.ConsumeFieldValue(number, wireType, message)
+		if fieldLength < 0 {
+			t.Fatalf("invalid field %d: %v", number, protowire.ParseError(fieldLength))
+		}
+		message = message[fieldLength:]
+	}
+	t.Fatalf("missing varint field %d", wanted)
+	return 0
 }

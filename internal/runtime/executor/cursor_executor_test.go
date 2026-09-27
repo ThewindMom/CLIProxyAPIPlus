@@ -39,10 +39,28 @@ func (s *fakeCursorStream) Done() <-chan struct{} { return s.done }
 func (s *fakeCursorStream) Err() error            { s.mu.Lock(); defer s.mu.Unlock(); return s.err }
 func (s *fakeCursorStream) Close()                { s.once.Do(func() { close(s.dead) }) }
 
-func newCursorExecutorHarness(process cursorFrameProcessor) *CursorExecutor {
+type cursorFrameProcessorWithoutSystemPrompt func(
+	context.Context,
+	cursorStream,
+	map[string][]byte,
+	[]cursorproto.McpToolDef,
+	func(string, bool),
+	func(pendingMcpExec),
+	<-chan []toolResultInfo,
+	*cursorTokenUsage,
+	func([]byte),
+) error
+
+func withIgnoredSystemPrompt(process cursorFrameProcessorWithoutSystemPrompt) cursorFrameProcessor {
+	return func(ctx context.Context, stream cursorStream, blobs map[string][]byte, tools []cursorproto.McpToolDef, _ string, onText func(string, bool), onExec func(pendingMcpExec), results <-chan []toolResultInfo, usage *cursorTokenUsage, checkpoint func([]byte)) error {
+		return process(ctx, stream, blobs, tools, onText, onExec, results, usage, checkpoint)
+	}
+}
+
+func newCursorExecutorHarness(process cursorFrameProcessorWithoutSystemPrompt) *CursorExecutor {
 	e := NewCursorExecutor(nil)
 	e.openStream = func(string) (cursorStream, error) { return newFakeCursorStream(), nil }
-	e.processFrames = process
+	e.processFrames = withIgnoredSystemPrompt(process)
 	return e
 }
 
@@ -252,6 +270,7 @@ func TestProcessH2SessionFramesBridgesCursorShellToClientTool(t *testing.T) {
 		stream,
 		map[string][]byte{},
 		[]cursorproto.McpToolDef{{Name: "shell_command"}},
+		"",
 		nil,
 		func(exec pendingMcpExec) { got = exec },
 		nil,
@@ -286,7 +305,7 @@ func TestProcessH2SessionFramesFailsUnsupportedExecRequest(t *testing.T) {
 	go func() {
 		stream.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
 	}()
-	err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, nil, nil, nil, nil, nil)
+	err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, "", nil, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "unsupported exec request field 99") {
 		t.Fatalf("processH2SessionFrames() error = %v", err)
 	}
@@ -311,7 +330,7 @@ func TestProcessH2SessionFramesAnswersListMcpResources(t *testing.T) {
 		stream.inner.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
 		close(stream.inner.data)
 	}()
-	if err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, nil, nil, nil, nil, nil); err != nil {
+	if err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, "", nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("processH2SessionFrames() error = %v", err)
 	}
 	if !bytes.Contains(written, []byte("list-resources")) {
@@ -1117,6 +1136,31 @@ func TestCursorExecuteStreamBackpressureCancellationUnblocks(t *testing.T) {
 	collectCursorStream(t, result)
 }
 
+func TestCursorResponsesTitleSystemPromptReachesRequestContext(t *testing.T) {
+	const titleInstruction = "Return only a concise title of at most three words."
+	var gotSystemPrompt string
+	e := NewCursorExecutor(nil)
+	e.openStream = func(string) (cursorStream, error) { return newFakeCursorStream(), nil }
+	e.processFrames = func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, systemPrompt string, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
+		gotSystemPrompt = systemPrompt
+		onText("Canary safety", false)
+		return nil
+	}
+
+	payload := []byte(`{"model":"cursor-test-model","stream":true,"prompt_cache_key":"title-one-off","input":[{"role":"system","content":"` + titleInstruction + `"},{"role":"user","content":[{"type":"input_text","text":"<user_message>Explain canary deployments.</user_message>"}]}],"tools":[]}`)
+	result, err := e.ExecuteStream(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectCursorStream(t, result)
+	if gotSystemPrompt != titleInstruction {
+		t.Fatalf("request-context system prompt = %q, want %q", gotSystemPrompt, titleInstruction)
+	}
+}
+
 func TestCursorOpenAIExecutorEmitsNoDoneChunk(t *testing.T) {
 	e := newCursorExecutorHarness(func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
 		onText("ok", false)
@@ -1167,10 +1211,10 @@ func TestCursorExecuteNonStreamFlattensConversationTurns(t *testing.T) {
 	e.openStream = func(string) (cursorStream, error) {
 		return &recordingCursorStream{inner: newFakeCursorStream(), capture: &written}, nil
 	}
-	e.processFrames = func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
+	e.processFrames = withIgnoredSystemPrompt(func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, onText func(string, bool), _ func(pendingMcpExec), _ <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
 		onText("answer", false)
 		return nil
-	}
+	})
 
 	payload := []byte(`{"model":"cursor-test-model","messages":[` +
 		`{"role":"user","content":"hi"},` +

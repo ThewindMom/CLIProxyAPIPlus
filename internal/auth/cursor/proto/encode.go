@@ -444,10 +444,23 @@ func EncodeKvSetBlobResult(kvId uint32) []byte {
 // --- Exec response encoders ---
 // Mirrors handleExecMessage() and sendExec() in cursor-fetch.ts
 
-// EncodeExecRequestContextResult responds to requestContextArgs with tool definitions.
-func EncodeExecRequestContextResult(execMsgId uint32, execId string, tools []McpToolDef) []byte {
-	// RequestContext with tools
+// EncodeExecRequestContextResult responds to requestContextArgs with caller instructions and tools.
+func EncodeExecRequestContextResult(execMsgId uint32, execId string, systemPrompt string, tools []McpToolDef) []byte {
+	// RequestContext with caller instructions and tools
 	rc := newMsg("RequestContext")
+	if systemPrompt != "" {
+		ruleType := newMsg("CursorRuleType")
+		setMsg(ruleType, "global", newMsg("CursorRuleTypeGlobal"))
+
+		rule := newMsg("CursorRule")
+		setStr(rule, "full_path", "/cliproxyapi/system-prompt.mdc")
+		setStr(rule, "content", systemPrompt)
+		setMsg(rule, "type", ruleType)
+		setInt32(rule, "source", 2) // CURSOR_RULE_SOURCE_USER
+
+		rulesField := field(rc, "rules")
+		rc.Mutable(rulesField).List().Append(protoreflect.ValueOfMessage(rule.ProtoReflect()))
+	}
 	if len(tools) > 0 {
 		toolsField := field(rc, "tools")
 		toolsList := rc.Mutable(toolsField).List()
