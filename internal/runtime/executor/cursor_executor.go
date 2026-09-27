@@ -553,7 +553,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 func isOpenAICompatibleSourceFormat(format sdktranslator.Format) bool {
-	return format.String() == "" || format.String() == "openai"
+	return format.String() == "" || format == sdktranslator.FormatOpenAI || format == sdktranslator.FormatOpenAIResponse
 }
 
 // ExecuteStream handles streaming requests. Native Claude requests can resume
@@ -1326,6 +1326,32 @@ func writeCursorReply(stream cursorStream, payload []byte) error {
 	return nil
 }
 
+func bridgeCursorShellToolCall(msg *cursorproto.DecodedServerMessage, tools []cursorproto.McpToolDef) (pendingMcpExec, bool) {
+	const toolName = "shell_command"
+	for _, tool := range tools {
+		if tool.Name != toolName {
+			continue
+		}
+		args := map[string]string{"command": msg.Command}
+		if msg.WorkingDirectory != "" {
+			args["workdir"] = msg.WorkingDirectory
+		}
+		encodedArgs, _ := json.Marshal(args)
+		toolCallID := normalizeToolCallID(msg.ExecId)
+		if toolCallID == "" {
+			toolCallID = uuid.New().String()
+		}
+		return pendingMcpExec{
+			ExecMsgId:  msg.ExecMsgId,
+			ExecId:     msg.ExecId,
+			ToolCallId: toolCallID,
+			ToolName:   toolName,
+			Args:       string(encodedArgs),
+		}, true
+	}
+	return pendingMcpExec{}, false
+}
+
 func processH2SessionFrames(
 	ctx context.Context,
 	stream cursorStream,
@@ -1448,6 +1474,11 @@ func processH2SessionFrames(
 					if errReply := writeCursorReply(stream, resp); errReply != nil {
 						return errReply
 					}
+				case cursorproto.ServerMsgExecMcpState:
+					resp := cursorproto.EncodeExecMcpStateResult(msg.ExecMsgId, msg.ExecId, msg.McpServerIDs, mcpTools)
+					if errReply := writeCursorReply(stream, resp); errReply != nil {
+						return errReply
+					}
 
 				case cursorproto.ServerMsgExecMcpArgs:
 					if onMcpExec != nil {
@@ -1529,6 +1560,12 @@ func processH2SessionFrames(
 										if errReply := writeCursorReply(stream, cursorproto.EncodeExecRequestContextResult(wmsg.ExecMsgId, wmsg.ExecId, mcpTools)); errReply != nil {
 											return errReply
 										}
+									case cursorproto.ServerMsgExecMcpState:
+										if errReply := writeCursorReply(stream, cursorproto.EncodeExecMcpStateResult(wmsg.ExecMsgId, wmsg.ExecId, wmsg.McpServerIDs, mcpTools)); errReply != nil {
+											return errReply
+										}
+									case cursorproto.ServerMsgExecOther:
+										return fmt.Errorf("cursor: unsupported exec request field %d", wmsg.ExecFieldNumber)
 									case cursorproto.ServerMsgCheckpoint:
 										if onCheckpoint != nil && len(wmsg.CheckpointData) > 0 {
 											onCheckpoint(wmsg.CheckpointData)
@@ -1575,6 +1612,12 @@ func processH2SessionFrames(
 						return errReply
 					}
 				case cursorproto.ServerMsgExecShellArgs, cursorproto.ServerMsgExecShellStream:
+					if onMcpExec != nil && toolResultCh == nil {
+						if toolCall, ok := bridgeCursorShellToolCall(msg, mcpTools); ok {
+							onMcpExec(toolCall)
+							return nil
+						}
+					}
 					if errReply := writeCursorReply(stream, cursorproto.EncodeExecShellRejected(msg.ExecMsgId, msg.ExecId, msg.Command, msg.WorkingDirectory, rejectReason)); errReply != nil {
 						return errReply
 					}
@@ -1594,6 +1637,8 @@ func processH2SessionFrames(
 					if errReply := writeCursorReply(stream, cursorproto.EncodeExecWriteShellStdinError(msg.ExecMsgId, msg.ExecId, rejectReason)); errReply != nil {
 						return errReply
 					}
+				case cursorproto.ServerMsgExecOther:
+					return fmt.Errorf("cursor: unsupported exec request field %d", msg.ExecFieldNumber)
 				}
 			}
 

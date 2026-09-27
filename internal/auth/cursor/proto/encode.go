@@ -49,6 +49,8 @@ type McpToolDef struct {
 	InputSchema json.RawMessage
 }
 
+const cursorClientToolProvider = "cliproxyapi-plus"
+
 // --- Helper: create a dynamic message and set fields ---
 
 func newMsg(name string) *dynamicpb.Message {
@@ -73,6 +75,10 @@ func setBytes(msg *dynamicpb.Message, name string, val []byte) {
 
 func setUint32(msg *dynamicpb.Message, name string, val uint32) {
 	msg.Set(field(msg, name), protoreflect.ValueOfUint32(val))
+}
+
+func setInt32(msg *dynamicpb.Message, name string, val int32) {
+	msg.Set(field(msg, name), protoreflect.ValueOfInt32(val))
 }
 
 func setBool(msg *dynamicpb.Message, name string, val bool) {
@@ -123,6 +129,7 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 		um := newMsg("UserMessage")
 		setStr(um, "text", turn.UserText)
 		setStr(um, "message_id", generateId())
+		setInt32(um, "mode", 1)
 		umBytes := marshal(um)
 
 		// Steps (assistant response)
@@ -179,6 +186,7 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 	userMessage := newMsg("UserMessage")
 	setStr(userMessage, "text", p.UserText)
 	setStr(userMessage, "message_id", p.MessageId)
+	setInt32(userMessage, "mode", 1)
 
 	// Images via SelectedContext
 	if len(p.Images) > 0 {
@@ -228,7 +236,7 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 			if len(tool.InputSchema) > 0 {
 				setBytes(td, "input_schema", jsonToProtobufValueBytes(tool.InputSchema))
 			}
-			setStr(td, "provider_identifier", "proxy")
+			setStr(td, "provider_identifier", cursorClientToolProvider)
 			setStr(td, "tool_name", tool.Name)
 			toolsList.Append(protoreflect.ValueOfMessage(td.ProtoReflect()))
 		}
@@ -249,6 +257,7 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 	userMessage := newMsg("UserMessage")
 	setStr(userMessage, "text", p.UserText)
 	setStr(userMessage, "message_id", p.MessageId)
+	setInt32(userMessage, "mode", 1)
 	if len(p.Images) > 0 {
 		sc := newMsg("SelectedContext")
 		imgsField := field(sc, "selected_images")
@@ -290,7 +299,7 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 			if len(tool.InputSchema) > 0 {
 				setBytes(td, "input_schema", jsonToProtobufValueBytes(tool.InputSchema))
 			}
-			setStr(td, "provider_identifier", "proxy")
+			setStr(td, "provider_identifier", cursorClientToolProvider)
 			setStr(td, "tool_name", tool.Name)
 			toolsList.Append(protoreflect.ValueOfMessage(td.ProtoReflect()))
 		}
@@ -350,7 +359,7 @@ func EncodeResumeRequest(p *ResumeRequestParams) []byte {
 			if len(tool.InputSchema) > 0 {
 				setBytes(td, "input_schema", jsonToProtobufValueBytes(tool.InputSchema))
 			}
-			setStr(td, "provider_identifier", "proxy")
+			setStr(td, "provider_identifier", cursorClientToolProvider)
 			setStr(td, "tool_name", tool.Name)
 			toolsList.Append(protoreflect.ValueOfMessage(td.ProtoReflect()))
 		}
@@ -388,7 +397,7 @@ func EncodeResumeRequest(p *ResumeRequestParams) []byte {
 			if len(tool.InputSchema) > 0 {
 				setBytes(td, "input_schema", jsonToProtobufValueBytes(tool.InputSchema))
 			}
-			setStr(td, "provider_identifier", "proxy")
+			setStr(td, "provider_identifier", cursorClientToolProvider)
 			setStr(td, "tool_name", tool.Name)
 			toolsList.Append(protoreflect.ValueOfMessage(td.ProtoReflect()))
 		}
@@ -449,7 +458,7 @@ func EncodeExecRequestContextResult(execMsgId uint32, execId string, tools []Mcp
 			if len(tool.InputSchema) > 0 {
 				setBytes(td, "input_schema", jsonToProtobufValueBytes(tool.InputSchema))
 			}
-			setStr(td, "provider_identifier", "proxy")
+			setStr(td, "provider_identifier", cursorClientToolProvider)
 			setStr(td, "tool_name", tool.Name)
 			toolsList.Append(protoreflect.ValueOfMessage(td.ProtoReflect()))
 		}
@@ -495,6 +504,69 @@ func EncodeExecMcpError(execMsgId uint32, execId string, errMsg string) []byte {
 	setMsg(result, "error", mcpErr)
 
 	return encodeExecClientMsg(execMsgId, execId, "mcp_result", result)
+}
+
+// EncodeExecMcpStateResult returns the dynamic tool catalog requested by newer Cursor agents.
+func EncodeExecMcpStateResult(execMsgId uint32, execId string, serverIDs []string, tools []McpToolDef) []byte {
+	if len(serverIDs) == 0 {
+		serverIDs = []string{cursorClientToolProvider}
+	}
+
+	var success []byte
+	for _, serverID := range serverIDs {
+		var server []byte
+		server = protowire.AppendTag(server, 1, protowire.BytesType)
+		server = protowire.AppendString(server, serverID)
+		server = protowire.AppendTag(server, 2, protowire.BytesType)
+		server = protowire.AppendString(server, serverID)
+		for _, tool := range tools {
+			definition := encodeMcpToolDefinition(tool)
+			server = protowire.AppendTag(server, 5, protowire.BytesType)
+			server = protowire.AppendBytes(server, definition)
+		}
+		server = protowire.AppendTag(server, 7, protowire.BytesType)
+		server = protowire.AppendString(server, "connected")
+		success = protowire.AppendTag(success, 1, protowire.BytesType)
+		success = protowire.AppendBytes(success, server)
+	}
+
+	var result []byte
+	result = protowire.AppendTag(result, 1, protowire.BytesType)
+	result = protowire.AppendBytes(result, success)
+
+	var execClient []byte
+	execClient = protowire.AppendTag(execClient, ECM_Id, protowire.VarintType)
+	execClient = protowire.AppendVarint(execClient, uint64(execMsgId))
+	execClient = protowire.AppendTag(execClient, ECM_ExecId, protowire.BytesType)
+	execClient = protowire.AppendString(execClient, execId)
+	execClient = protowire.AppendTag(execClient, ECM_McpStateExecResult, protowire.BytesType)
+	execClient = protowire.AppendBytes(execClient, result)
+
+	var client []byte
+	client = protowire.AppendTag(client, 2, protowire.BytesType)
+	client = protowire.AppendBytes(client, execClient)
+	return client
+}
+
+func encodeMcpToolDefinition(tool McpToolDef) []byte {
+	var definition []byte
+	definition = protowire.AppendTag(definition, 1, protowire.BytesType)
+	definition = protowire.AppendString(definition, tool.Name)
+	definition = protowire.AppendTag(definition, 2, protowire.BytesType)
+	definition = protowire.AppendString(definition, tool.Description)
+	if len(tool.InputSchema) > 0 {
+		definition = protowire.AppendTag(definition, 3, protowire.BytesType)
+		definition = protowire.AppendBytes(definition, jsonToProtobufValueBytes(tool.InputSchema))
+	}
+	definition = protowire.AppendTag(definition, 4, protowire.BytesType)
+	definition = protowire.AppendString(definition, cursorClientToolProvider)
+	definition = protowire.AppendTag(definition, 5, protowire.BytesType)
+	definition = protowire.AppendString(definition, tool.Name)
+	if len(tool.InputSchema) > 0 {
+		definition = protowire.AppendTag(definition, 6, protowire.BytesType)
+		definition = protowire.AppendString(definition, string(tool.InputSchema))
+	}
+	return definition
 }
 
 // --- Rejection encoders (mirror handleExecMessage rejections) ---

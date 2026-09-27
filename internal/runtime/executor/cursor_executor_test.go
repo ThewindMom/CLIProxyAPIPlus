@@ -17,6 +17,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 type fakeCursorStream struct {
@@ -164,6 +165,130 @@ func TestCursorExecuteToolResultUsesColdContinuation(t *testing.T) {
 	}
 	if processCount != 2 {
 		t.Fatalf("processor calls = %d, want 2", processCount)
+	}
+}
+
+func TestCursorExecuteResponsesToolCallUsesColdContinuation(t *testing.T) {
+	e := newCursorExecutorHarness(func(_ context.Context, _ cursorStream, _ map[string][]byte, _ anyMCPTools, _ func(string, bool), onMcpExec func(pendingMcpExec), toolResultCh <-chan []toolResultInfo, _ *cursorTokenUsage, _ func([]byte)) error {
+		if onMcpExec == nil {
+			return errors.New("Responses non-stream request did not install an MCP callback")
+		}
+		if toolResultCh != nil {
+			return errors.New("Responses non-stream request parked an H2 tool session")
+		}
+		onMcpExec(pendingMcpExec{ToolCallId: "call_responses", ToolName: "read", Args: `{"path":"README.md"}`})
+		return nil
+	})
+
+	payload := []byte(`{"model":"cursor-test-model","input":"read README.md","tools":[{"type":"function","name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]}`)
+	response, err := e.Execute(context.Background(), cursorTestAuth(), cliproxyexecutor.Request{Model: "cursor-test-model", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: payload,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(response.Payload, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("output type = %q, want function_call; payload=%s", got, response.Payload)
+	}
+	if got := gjson.GetBytes(response.Payload, "output.0.name").String(); got != "read" {
+		t.Fatalf("tool name = %q, want read", got)
+	}
+}
+
+func TestBridgeCursorShellToolCall(t *testing.T) {
+	msg := &cursorproto.DecodedServerMessage{
+		ExecMsgId:        7,
+		ExecId:           "shell-exec",
+		Command:          "cat BUILDINFO",
+		WorkingDirectory: "/tmp/build",
+	}
+	tools := []cursorproto.McpToolDef{{Name: "shell_command"}}
+
+	toolCall, ok := bridgeCursorShellToolCall(msg, tools)
+	if !ok {
+		t.Fatal("bridgeCursorShellToolCall() did not bridge an available shell_command tool")
+	}
+	if toolCall.ToolName != "shell_command" {
+		t.Fatalf("tool name = %q, want shell_command", toolCall.ToolName)
+	}
+	if got := gjson.Get(toolCall.Args, "command").String(); got != "cat BUILDINFO" {
+		t.Fatalf("command = %q, want cat BUILDINFO", got)
+	}
+	if got := gjson.Get(toolCall.Args, "workdir").String(); got != "/tmp/build" {
+		t.Fatalf("workdir = %q, want /tmp/build", got)
+	}
+	if _, ok := bridgeCursorShellToolCall(msg, []cursorproto.McpToolDef{{Name: "other_tool"}}); ok {
+		t.Fatal("bridgeCursorShellToolCall() bridged an unavailable shell_command tool")
+	}
+}
+
+func TestProcessH2SessionFramesBridgesCursorShellToClientTool(t *testing.T) {
+	var shellArgs []byte
+	shellArgs = protowire.AppendTag(shellArgs, cursorproto.SHA_Command, protowire.BytesType)
+	shellArgs = protowire.AppendString(shellArgs, "cat BUILDINFO")
+	shellArgs = protowire.AppendTag(shellArgs, cursorproto.SHA_WorkingDirectory, protowire.BytesType)
+	shellArgs = protowire.AppendString(shellArgs, "/tmp/build")
+
+	var execMessage []byte
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_Id, protowire.VarintType)
+	execMessage = protowire.AppendVarint(execMessage, 7)
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ShellStreamArgs, protowire.BytesType)
+	execMessage = protowire.AppendBytes(execMessage, shellArgs)
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ExecId, protowire.BytesType)
+	execMessage = protowire.AppendString(execMessage, "shell-exec")
+
+	var serverMessage []byte
+	serverMessage = protowire.AppendTag(serverMessage, cursorproto.ASM_ExecServerMessage, protowire.BytesType)
+	serverMessage = protowire.AppendBytes(serverMessage, execMessage)
+
+	stream := newFakeCursorStream()
+	go func() {
+		stream.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
+	}()
+	var got pendingMcpExec
+	err := processH2SessionFrames(
+		context.Background(),
+		stream,
+		map[string][]byte{},
+		[]cursorproto.McpToolDef{{Name: "shell_command"}},
+		nil,
+		func(exec pendingMcpExec) { got = exec },
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("processH2SessionFrames() error = %v", err)
+	}
+	if got.ToolName != "shell_command" {
+		t.Fatalf("bridged tool name = %q, want shell_command", got.ToolName)
+	}
+	if command := gjson.Get(got.Args, "command").String(); command != "cat BUILDINFO" {
+		t.Fatalf("bridged command = %q, want cat BUILDINFO", command)
+	}
+}
+
+func TestProcessH2SessionFramesFailsUnsupportedExecRequest(t *testing.T) {
+	var execMessage []byte
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_Id, protowire.VarintType)
+	execMessage = protowire.AppendVarint(execMessage, 7)
+	execMessage = protowire.AppendTag(execMessage, 17, protowire.BytesType)
+	execMessage = protowire.AppendBytes(execMessage, nil)
+	execMessage = protowire.AppendTag(execMessage, cursorproto.ESM_ExecId, protowire.BytesType)
+	execMessage = protowire.AppendString(execMessage, "unsupported-exec")
+
+	var serverMessage []byte
+	serverMessage = protowire.AppendTag(serverMessage, cursorproto.ASM_ExecServerMessage, protowire.BytesType)
+	serverMessage = protowire.AppendBytes(serverMessage, execMessage)
+
+	stream := newFakeCursorStream()
+	go func() {
+		stream.data <- cursorproto.FrameConnectMessage(serverMessage, 0)
+	}()
+	err := processH2SessionFrames(context.Background(), stream, map[string][]byte{}, nil, nil, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported exec request field 17") {
+		t.Fatalf("processH2SessionFrames() error = %v", err)
 	}
 }
 

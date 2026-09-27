@@ -31,6 +31,7 @@ const (
 	ServerMsgExecShellStream                       // Rejected: shell stream
 	ServerMsgExecBgShellSpawn                      // Rejected: background shell
 	ServerMsgExecWriteShellStdin                   // Rejected: write shell stdin
+	ServerMsgExecMcpState                          // Server requests dynamic MCP tool state
 	ServerMsgExecOther                             // Other exec types (respond with empty)
 	ServerMsgTurnEnded                             // Turn has ended (no more output)
 	ServerMsgHeartbeat                             // Server heartbeat
@@ -58,6 +59,7 @@ type DecodedServerMessage struct {
 	McpToolName   string
 	McpToolCallId string
 	McpArgs       map[string][]byte // arg name -> protobuf-encoded value
+	McpServerIDs  []string
 
 	// For rejection context
 	Path             string
@@ -84,7 +86,8 @@ func isReplyRequiredType(t ServerMessageType) bool {
 		ServerMsgExecShellArgs, ServerMsgExecReadArgs, ServerMsgExecWriteArgs,
 		ServerMsgExecDeleteArgs, ServerMsgExecLsArgs, ServerMsgExecGrepArgs,
 		ServerMsgExecFetchArgs, ServerMsgExecDiagnostics, ServerMsgExecShellStream,
-		ServerMsgExecBgShellSpawn, ServerMsgExecWriteShellStdin, ServerMsgExecOther:
+		ServerMsgExecBgShellSpawn, ServerMsgExecWriteShellStdin, ServerMsgExecMcpState,
+		ServerMsgExecOther:
 		return true
 	}
 	return false
@@ -369,6 +372,9 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 				decodeShellArgs(val, msg) // same structure
 			case ESM_WriteShellStdinArgs:
 				msg.Type = ServerMsgExecWriteShellStdin
+			case ESM_McpStateExecArgs:
+				msg.Type = ServerMsgExecMcpState
+				msg.McpServerIDs = decodeRepeatedStringField(val, 1)
 			default:
 				// Unknown exec types - only set if we haven't identified the type yet
 				// (other fields like span_context (19) come after the exec type field)
@@ -386,6 +392,34 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 			data = data[n:]
 		}
 	}
+}
+
+func decodeRepeatedStringField(data []byte, fieldNumber protowire.Number) []string {
+	var values []string
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return values
+		}
+		data = data[n:]
+		if typ == protowire.BytesType {
+			value, consumed := protowire.ConsumeBytes(data)
+			if consumed < 0 {
+				return values
+			}
+			data = data[consumed:]
+			if num == fieldNumber {
+				values = append(values, string(value))
+			}
+			continue
+		}
+		consumed := protowire.ConsumeFieldValue(num, typ, data)
+		if consumed < 0 {
+			return values
+		}
+		data = data[consumed:]
+	}
+	return values
 }
 
 func decodeMcpArgs(data []byte, msg *DecodedServerMessage) {
