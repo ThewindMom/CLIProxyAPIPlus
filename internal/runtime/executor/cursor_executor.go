@@ -560,8 +560,9 @@ func isOpenAICompatibleSourceFormat(format sdktranslator.Format) bool {
 	return format.String() == "" || format == sdktranslator.FormatOpenAI || format == sdktranslator.FormatOpenAIResponse
 }
 
-// ExecuteStream handles streaming requests and keeps the upstream H2 session
-// parked across downstream tool-call request boundaries.
+// ExecuteStream handles streaming requests. Native Claude requests can resume
+// a parked MCP/H2 session; OpenAI-compatible tool results use a fresh request
+// rebuilt from the complete client transcript.
 func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	usageReporter := helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
 	defer usageReporter.EnsurePublished(ctx)
@@ -614,15 +615,27 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	authID := auth.ID // e.g. "cursor.json" or "cursor-account2.json"
 	log.Debugf("cursor: conversationId=%s authID=%s", conversationId, authID)
 
+	// Native Claude requests retain the current resumable-H2 behavior. OpenAI
+	// clients may cross a gateway boundary between the tool call and its result,
+	// so their continuation is rebuilt from the complete transcript instead.
+	openAICompatible := isOpenAICompatibleSourceFormat(from)
+	coldToolContinuation := openAICompatible && len(parsed.ToolResults) > 0
 	sessionKey := authID + ":" + conversationId
 	checkpointKey := conversationId
 	needsTranslate := from.String() != "" && from.String() != "openai"
-	coldToolContinuation := false
 
-	// Continue a live Cursor H2 session when the caller returns tool results.
-	// This works across all source protocols: the HTTP request may end at the
-	// tool boundary while the upstream Cursor stream remains parked.
-	if len(parsed.ToolResults) > 0 {
+	if coldToolContinuation {
+		e.retireConversationState(conversationId)
+		log.WithFields(log.Fields{
+			"conversation_id": conversationId,
+			"reason":          "protocol_boundary",
+			"tool_results":    len(parsed.ToolResults),
+		}).Infof("cursor: rebuilding tool continuation from transcript (reason=protocol_boundary tool_results=%d)", len(parsed.ToolResults))
+	}
+
+	// Native Claude requests retain same-stream resume. OpenAI-compatible
+	// clients continue from their authoritative transcript in a fresh request.
+	if len(parsed.ToolResults) > 0 && !coldToolContinuation {
 		fallbackReason := "missing_session"
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
@@ -739,7 +752,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		stream.Close()
 		return nil, fmt.Errorf("cursor: failed to send request: %w", err)
 	}
+	// The Cursor stream lives only for this HTTP request when serving an
+	// OpenAI-compatible client. Native Claude tool calls can still retain it.
 	sessionParent := context.Background()
+	if openAICompatible {
+		sessionParent = ctx
+	}
 	sessionCtx, sessionCancel := context.WithCancel(sessionParent)
 	if !e.attachConversationStream(conversationId, streamOwner, sessionCancel, stream) {
 		sessionCancel()
@@ -754,7 +772,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	var streamParam any
 
-	toolResultCh := make(chan []toolResultInfo, 1)
+	// OpenAI-compatible tool results use a fresh request with the full transcript.
+	// A nil channel tells the frame processor to finish immediately after emitting
+	// an MCP tool call instead of parking this H2 connection.
+	var toolResultCh chan []toolResultInfo
+	if !openAICompatible {
+		toolResultCh = make(chan []toolResultInfo, 1)
+	}
 
 	// Switchable output starts with the current HTTP response channel.
 	var outMu sync.Mutex
@@ -884,6 +908,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				sendChunkSwitchable(toolCallJSON, "")
 				sendChunkSwitchable(`{}`, `"tool_calls"`)
 				sendDoneSwitchable()
+
+				if openAICompatible {
+					closeCurrentOutput()
+					log.Debugf("cursor: ended H2 stream after MCP tool call (tool=%s)", exec.ToolName)
+					return
+				}
 
 				// Publish the resumable session before closing the current output.
 				// Channel closure lets the client submit its tool result immediately;
